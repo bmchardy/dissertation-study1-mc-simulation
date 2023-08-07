@@ -1,1 +1,1 @@
-# dissertation-study1-mc-simulation
+# Study 1 Monte Carlo Simulation
