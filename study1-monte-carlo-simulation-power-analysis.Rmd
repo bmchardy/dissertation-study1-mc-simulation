@@ -1,0 +1,512 @@
+---
+title: "CGS-D Study 1 Monte Carlo Simulation Power Analysis"
+author: "Bobby McHardy"
+date: "06/08/2023"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_float: yes
+    toc_collapsed: yes
+    toc_depth: 3
+    number_sections: yes
+    code_folding: hide
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r imports, results=FALSE, warnings=FALSE}
+library(simsem)
+library(lavaan)
+library(semTools)
+```
+
+```{r setup, include=FALSE}
+# Register an inline hook
+knitr::knit_hooks$set(inline = function(x) {
+  paste(custom_print(x), collapse = ", ")
+})
+# Define a function factory
+op <- function(d = 2) {
+  function(x) sprintf(paste0("%1.", d, "f"), x)
+}
+# Use a closure
+custom_print <- op()
+```
+
+## Simulation 1 (Donnelly et al., 2022)
+
+The below code is copied from Donnelly et al. (2022, Table 4, *Behav. Res. Mthds.*, https://doi.org/10.3758/s13428-022-01996-0). I want to try Monte Carlo power simulation for a completely fixed-parameter moderated mediation model so that I understand what I'm doing when I start modifying for a one-fixed, one-free parameter model in `simulation2` and `simulation3`, below.
+
+```{r simulation1}
+N.per.group <- 25 # balanced group sample sizes
+designMatrix <- expand.grid(X = 1:0, W = 1:0)
+designMatrix$XW <- designMatrix$X * designMatrix$W # interaction term
+exoData <- do.call(rbind, lapply(1:N.per.group, function(i) designMatrix))
+a.w0 <- .5 # effect of X on M when moderator (W) == 0
+a.mod <- .3 # how much "a" path is moderated by W (i.e., interaction); i.e., the change when under moderation
+b.w0 <- .4 # effect of M on Y when moderator (W) == 0
+b.mod <- 0 # no moderating effect on "b" path
+c.w0 <- .2 # effect of X on Y when moderator (W) == 0
+c.mod <- 0 # no moderating effect on "c" path
+w.M <- .1 # simple effect of moderator (W) on M when X == 0
+w.Y <- -.1 # simple effect of moderator (W) on Y when X == 0
+
+# design our exogenous model paths for free parameters and population-estimate params
+kappa.free <- kappa.pop <- matrix(NA,  # estimate all effects
+                                  nrow = 2, # 2 outcomes (M and Y)
+                                  ncol = 3, # dummy coded X, W, XW
+                                  dimnames = list(c("M","Y"),  names(exoData)))
+kappa.free["M","X"] <- "a.w0" # label free parameters
+kappa.free["M","W"] <- "w.M" # (to define indirect effects)
+kappa.free["M","XW"] <- "a.mod"
+kappa.free["Y","X"] <- "c.w0"
+kappa.free["Y","W"] <- "w.Y"
+# fixed to 0 because we do not want the moderator to have an effect on outcome; can label like the others if we want to free
+kappa.free["Y","XW"] <- 0
+kappa.pop["M","X"] <- a.w0 # set population parameters
+kappa.pop["M","W"] <- w.M  # (defined above)
+kappa.pop["M","XW"] <- a.mod
+kappa.pop["Y","X"] <- c.w0
+kappa.pop["Y","W"] <- w.Y
+kappa.pop["Y","XW"] <- c.mod
+exoPaths <- bind(free = kappa.free, popParam = kappa.pop)
+
+# design our endogenous model paths for free parameters and population-estimate params
+beta.free <- beta.pop <- matrix(0,
+                                nrow = 2,
+                                ncol = 2,
+                                dimnames = list(c("M","Y"), c("M","Y")))
+beta.free["Y", "M"] <- "b"
+beta.pop["Y", "M"] <- b.w0
+endoPaths <- bind(free = beta.free, popParam = beta.pop)
+
+residCor <- binds(free = diag(as.numeric(NA), 2), popParam = diag(2))
+
+# lavaan syntax to specify our model parameters
+userParams <- ' ## conditional indirect effects
+    ind.w0 := a.w0 * b
+    ind.w1 := (a.w0 + a.mod) * b
+  ## Test H0: equivalent indirect effects across W
+    ind.diff := a.mod * b
+  ## or equivalently:
+  # ind.diff := ind.w1 – ind.w0 '
+
+# specify our moderated mediation model
+modMed1 <- model.path(BE = endoPaths, # the "Beta matrix"; i.e., our endogenous paths
+                      RPS = residCor, # residual correlations matrix
+                      KA = exoPaths, # the "Kappa matrix"; i.e., our exogenous paths
+                      con = userParams, # our model parameters to estimate
+                      indLab = rownames(kappa.free), # endogenous variable labels
+                      covLab = colnames(kappa.free)) # exogenous variable labels
+
+# Uses the semTools package to determine the Monte Carlo estimates of Confidence Intervals (MCCIs) for this simulation. An MCCI through zero, of course, represents no effect with 95% confidence
+rejectMCCI <- function(object) {
+  CIs <- semTools::monteCarloCI(object)
+  # for each row:
+  #   return TRUE if the MCCI overlaps 0 (i.e., we reject H_0)
+  #   return FALSE if the MCCI does not overal 0 (i.e., we fail to reject H_0)
+  apply(CIs, 1, function(CI) 0 < CI["ci.lower"] | 0 > CI["ci.upper"])
+}
+
+# simulate `model` `nRep` times, using our `exoData` dataset of length `nrow(exoData)`as input
+# with random seed `seed`.
+# Additionally, the rejectMCCI function uses the semTools package to determine the Monte Carlo estimates of Confidence Intervals (MCCIs) for this simulation. An MCCI through zero, of course, represents no effect with 95% confidence, and will pass our simulated output through this function for ease of interpretation
+sim1 <- sim(nRep = 20, model = modMed1, covData = exoData,
+            n = nrow(exoData), seed = 12345, outfun = rejectMCCI,
+            meanstructure = FALSE) # pass this argument to lavaan
+
+# describes power for each parameter
+# column 'estimate average' is the average value for this model parameter across all simulations
+# column 'power (Not equal 0)' is the estimated power to reject H_0 for this model parameter across all simulations
+# column 'average bias' is the difference between 'estimate average' and the specified population parameter for this model parameter across all simulations; abs(average bias) should be < 0.10 to be acceptable
+# column 'coverage' is the % of 95% CIs in which the 'estimate average' falls; i.e., 95% would be the expected value; large divergence from 95% coverage suggests misspecification of the parameter
+summaryParam(sim1, matchParam = TRUE, digits = 3)
+
+# get the output of `rejectMCCI`
+# each column contains reject (TRUE) do not reject (FALSE) decisions for each repetition of the simulation for each model parameter
+testMCCI <- do.call(rbind, getExtraOutput(sim1))
+
+# average each column to get the average estimated power to reject H_0 for that model parameter
+# we'll select our sample size based on the estimated power for the indirect effect under both conditions of the moderator (i.e., > ,8)
+colMeans(testMCCI) # empirical estimate of power for Monte Carlo CIs
+```
+
+# Simulation 2
+
+Run a Monte Carlo simulation for moderated mediation. The below code was derived from Donnelly et al. (2022, Table 4, Behav. Res. Mthds.) by B. McHardy on August 6, 2023. Specifically, I changed the distribution of `X` from a two-level categorical variable to a normally distributed variable.
+
+```{r simulation2}
+# balanced group sample sizes; i.e., group N = N_total / 2
+N_total <- 50
+
+# instantiate an exoData data frame for exogenous variables; start W as an index vector
+exoData <- expand.grid(W = 1:(N_total))
+# the moderator W will be a binary 0/1, for dichotomized high/low SR
+exoData$W <- exoData$W %% 2
+# draw X from a standard normal distribution; my model will also be using a standardized X
+exoData$X <- rnorm(N_total, 0, 1)
+exoData$XW <- exoData$X * exoData$W # interaction term
+
+a.w0 <- .5 # effect of X on M when moderator (W) == 0
+a.mod <- .3 # how much "a" path is moderated by W (the interaction); i.e., the change when under moderation
+b.w0 <- .4 # effect of M on Y when moderator (W) == 0
+b.mod <- 0 # no moderating effect on "b" path
+c.w0 <- .2 # effect of X on Y when moderator (W) == 0
+c.mod <- 0 # no moderating effect on "c" path
+w.M <- .1 # simple effect of moderator (W) on M when X == 0
+w.Y <- -.1 # simple effect of moderator (W) on Y when X == 0
+
+# design our exogenous model paths for free parameters and population-estimate params
+kappa.free <- kappa.pop <- matrix(NA,  # estimate all effects
+                                  nrow = 2, # 2 outcomes (M and Y)
+                                  ncol = 3, # dummy coded X, W, XW
+                                  dimnames = list(c("M","Y"),  names(exoData)))
+kappa.free["M","X"] <- "a.w0" # label free parameters
+kappa.free["M","W"] <- "w.M" # (to define indirect effects)
+kappa.free["M","XW"] <- "a.mod"
+kappa.free["Y","X"] <- "c.w0"
+kappa.free["Y","W"] <- "w.Y"
+# fixed to 0 because we do not want the moderator to have an effect on outcome; can label like the others if we want to free
+kappa.free["Y","XW"] <- 0
+kappa.pop["M","X"] <- a.w0 # set population parameters
+kappa.pop["M","W"] <- w.M  # (defined above)
+kappa.pop["M","XW"] <- a.mod
+kappa.pop["Y","X"] <- c.w0
+kappa.pop["Y","W"] <- w.Y
+kappa.pop["Y","XW"] <- c.mod
+exoPaths <- bind(free = kappa.free, popParam = kappa.pop)
+
+# design our endogenous model paths for free parameters and population-estimate params
+beta.free <- beta.pop <- matrix(0,
+                                nrow = 2,
+                                ncol = 2,
+                                dimnames = list(c("M","Y"), c("M","Y")))
+beta.free["Y", "M"] <- "b"
+beta.pop["Y", "M"] <- b.w0
+endoPaths <- bind(free = beta.free, popParam = beta.pop)
+
+residCor <- binds(free = diag(as.numeric(NA), 2), popParam = diag(2))
+
+# lavaan syntax to specify our model parameters
+userParams <- ' ## conditional indirect effects
+    ind.w0 := a.w0 * b
+    ind.w1 := (a.w0 + a.mod) * b
+  ## Test H0: equivalent indirect effects across W
+    ind.diff := a.mod * b
+  ## or equivalently:
+  # ind.diff := ind.w1 – ind.w0 '
+
+# specify our moderated mediation model
+modMed1 <- model.path(BE = endoPaths, # the "Beta matrix"; i.e., our endogenous paths
+                      RPS = residCor, # residual correlations matrix
+                      KA = exoPaths, # the "Kappa matrix"; i.e., our exogenous paths
+                      con = userParams, # our model parameters to estimate
+                      indLab = rownames(kappa.free), # endogenous variable labels
+                      covLab = colnames(kappa.free)) # exogenous variable labels
+
+# Uses the semTools package to determine the Monte Carlo estimates of Confidence Intervals (MCCIs) for this simulation. An MCCI through zero, of course, represents no effect with 95% confidence
+rejectMCCI <- function(object) {
+  CIs <- semTools::monteCarloCI(object)
+  # for each row:
+  #   return TRUE if the MCCI overlaps 0 (i.e., we reject H_0)
+  #   return FALSE if the MCCI does not overal 0 (i.e., we fail to reject H_0)
+  apply(CIs, 1, function(CI) 0 < CI["ci.lower"] | 0 > CI["ci.upper"])
+}
+
+# see: https://cran.r-project.org/web/packages/simsem/simsem.pdf
+# simulate `model nRep times, using our `exoData` dataset of length `nrow(exoData)`as input
+# with random seed `seed`.
+# Additionally, the rejectMCCI function uses the semTools package to determine the Monte Carlo estimates of Confidence Intervals (MCCIs) for this simulation. An MCCI through zero, of course, represents no effect with 95% confidence, and will pass our simulated output through this function for ease of interpretation
+sim1 <- sim(nRep = 20, model = modMed1, covData = exoData,
+            n = nrow(exoData), seed = 12345, outfun = rejectMCCI,
+            meanstructure = FALSE)
+
+# describes power for each parameter
+# column 'estimate average' is the average value for this model parameter across all simulations
+# column 'power (Not equal 0)' is the estimated power to reject H_0 for this model parameter across all simulations
+# column 'average bias' is the difference between 'estimate average' and the specified population parameter for this model parameter across all simulations; abs(average bias) should be < 0.10 to be acceptable
+# column 'coverage' is the % of 95% CIs in which the 'estimate average' falls; i.e., 95% would be the expected value; large divergence from 95% coverage suggests misspecification of the parameter
+summaryParam(sim1, matchParam = TRUE, digits = 3)
+
+# get the output of `rejectMCCI`
+# each column contains reject (TRUE) do not reject (FALSE) decisions for each repetition of the simulation for each model parameter
+testMCCI <- do.call(rbind, getExtraOutput(sim1))
+
+# average each column to get the average estimated power to reject H_0 for that model parameter
+# we'll select our sample size based on the estimated power for the indirect effect under both conditions of the moderator (i.e., > ,8)
+colMeans(testMCCI) # empirical estimate of power for Monte Carlo CIs
+```
+
+# Simulation 3
+
+`simulation 3` is an extension of `simulation 2`.
+
+Firstly, I am expanding the number of samples, `nRep` in `sim()`, to $N = 5000$ to be consistent with the literature (Donnelly et al., 2022).
+
+Secondly, I am updating the effect sizes for each path as follows:
+
+  Parameter   Effect Size
+------------- -------------
+     a.w0     .60
+    a.mod     -.30
+     b.w0     .35
+    b.mod     .00
+     c.w0     .35
+    c.mod     .00
+
+I selected these effect sizes for theoretical reasons (Lakens et al., 2018, *Adv. Mthds. Prac. Psych. Sci.*, https://doi.org/10.1177/2515245918770963).
+
+Thirdly, I am running this simulation for sample sizes of $N = 200$ to $N = 300$ to determine minimum sample size for this desired model with these desired effect sizes. I've chosen this range of $N$ based on my preliminary testing. Final power estimates for each $N$ will be stored in the following table:
+
+```{r simulation.table.main}
+# effect sizes by N
+effectsByN <- data.frame(0.00, 0.00, 0.00, 0.00)
+# name all columns
+names(effectsByN) <- c("N", "Ind. W0", "Ind. W1", "Ind. Diff.")
+
+# display for illustration
+effectsByN
+```
+
+We'll use this table to select our final $N_{min}$ that gives $Power = .80$ across all three indirect parameters of interest.
+
+```{r simulation3, message=FALSE, warning=FALSE, include=FALSE, results=FALSE}
+# balanced group sample sizes; i.e., group N = N_total / 2
+N_total <- 200
+
+for (N_total in seq(200, 300, by=2)) {
+  # instantiate an exoData data frame for exogenous variables; start W as an index vector
+  exoData <- expand.grid(W = 1:(N_total))
+  # the moderator W will be a binary 0/1, for dichotomized high/low SR
+  exoData$W <- exoData$W %% 2
+  # draw X from a standard normal distribution; my model will also be using a standardized X
+  exoData$X <- rnorm(N_total, 0, 1)
+  exoData$XW <- exoData$X * exoData$W # interaction term
+  
+  # effect of X on M when moderator (W) == 0 (want to be able to detect a small/medium effect size of X -> M when W is *low*; X and M will with good effect size for theoretical reasons)
+  a.w0 = .6
+  # how much "a" path is moderated by W (i.e., interaction); i.e., the change when under moderation (want to be able to detect a small effect size *decrease* on the X -> M path [i.e., such that X -> M will *become* small] when W is *high*)
+  a.mod = -.3
+  # effect of M on Y when moderator (W) == 0 (small/medium effect size of X -> Y)
+  b.w0 = .35
+  # no moderating effect on "b" path (not looking at W as a moderator of path b)
+  b.mod = 0
+  # effect of X on Y when moderator (W) == 0 (small/medium effect size of X -> Y)
+  c.w0 = .35
+  # no moderating effect on "c" path (not looking at W as a moderator of path c)
+  c.mod = 0
+  # constraints on the associative effects of W with M, Y; not required
+  w.M <- .1 # simple effect of moderator (W) on M when X == 0
+  w.Y <- -.1 # simple effect of moderator (W) on Y when X == 0
+  
+  # design our exogenous model paths for free parameters and population-estimate params
+  kappa.free <- kappa.pop <- matrix(NA,  # estimate all effects
+                                    nrow = 2, # 2 outcomes (M and Y)
+                                    ncol = 3, # dummy coded X, W, XW
+                                    dimnames = list(c("M","Y"),  names(exoData)))
+  kappa.free["M","X"] <- "a.w0" # label free parameters
+  kappa.free["M","W"] <- "w.M" # (to define indirect effects)
+  kappa.free["M","XW"] <- "a.mod"
+  kappa.free["Y","X"] <- "c.w0"
+  kappa.free["Y","W"] <- "w.Y"
+  # fixed to 0 because we do not want the moderator to have an effect on outcome; can label like the others if we want to free
+  kappa.free["Y","XW"] <- 0
+  kappa.pop["M","X"] <- a.w0 # set population parameters
+  kappa.pop["M","W"] <- w.M  # (defined above)
+  kappa.pop["M","XW"] <- a.mod
+  kappa.pop["Y","X"] <- c.w0
+  kappa.pop["Y","W"] <- w.Y
+  kappa.pop["Y","XW"] <- c.mod
+  exoPaths <- bind(free = kappa.free, popParam = kappa.pop)
+  
+  # design our endogenous model paths for free parameters and population-estimate params
+  beta.free <- beta.pop <- matrix(0,
+                                  nrow = 2,
+                                  ncol = 2,
+                                  dimnames = list(c("M","Y"), c("M","Y")))
+  beta.free["Y", "M"] <- "b"
+  beta.pop["Y", "M"] <- b.w0
+  endoPaths <- bind(free = beta.free, popParam = beta.pop)
+  
+  residCor <- binds(free = diag(as.numeric(NA), 2), popParam = diag(2))
+  
+  # lavaan syntax to specify our model parameters
+  userParams <- ' ## conditional indirect effects
+      ind.w0 := a.w0 * b
+      ind.w1 := (a.w0 + a.mod) * b
+    ## Test H0: equivalent indirect effects across W
+      ind.diff := a.mod * b
+    ## or equivalently:
+    # ind.diff := ind.w1 – ind.w0 '
+  
+  # specify our moderated mediation model
+  modMed1 <- model.path(BE = endoPaths, # the "Beta matrix"; i.e., our endogenous paths
+                        RPS = residCor, # residual correlations matrix
+                        KA = exoPaths, # the "Kappa matrix"; i.e., our exogenous paths
+                        con = userParams, # our model parameters to estimate
+                        indLab = rownames(kappa.free), # endogenous variable labels
+                        covLab = colnames(kappa.free)) # exogenous variable labels
+  
+  # Uses the semTools package to determine the Monte Carlo estimates of Confidence Intervals (MCCIs) for this simulation. An MCCI through zero, of course, represents no effect with 95% confidence
+  rejectMCCI <- function(object) {
+    CIs <- semTools::monteCarloCI(object)
+    # for each row:
+    #   return TRUE if the MCCI overlaps 0 (i.e., we reject H_0)
+    #   return FALSE if the MCCI does not overal 0 (i.e., we fail to reject H_0)
+    apply(CIs, 1, function(CI) 0 < CI["ci.lower"] | 0 > CI["ci.upper"])
+  }
+  
+  # see: https://cran.r-project.org/web/packages/simsem/simsem.pdf
+  # simulate `model nRep times, using our `exoData` dataset of length `nrow(exoData)`as input
+  # with random seed `seed`.
+  # Additionally, the rejectMCCI function uses the semTools package to determine the Monte Carlo estimates of Confidence Intervals (MCCIs) for this simulation. An MCCI through zero, of course, represents no effect with 95% confidence, and will pass our simulated output through this function for ease of interpretation
+  sim1 <- sim(nRep = 5000, model = modMed1, covData = exoData,
+              n = nrow(exoData), seed = 12345, outfun = rejectMCCI,
+              meanstructure = FALSE)
+  
+  # describes power for each parameter
+  # column 'estimate average' is the average value for this model parameter across all simulations
+  # column 'power (Not equal 0)' is the estimated power to reject H_0 for this model parameter across all simulations
+  # column 'average bias' is the difference between 'estimate average' and the specified population parameter for this model parameter across all simulations; abs(average bias) should be < 0.10 to be acceptable
+  # column 'coverage' is the % of 95% CIs in which the 'estimate average' falls; i.e., 95% would be the expected value; large divergence from 95% coverage suggests misspecification of the parameter
+  summaryParam(sim1, matchParam = TRUE, digits = 3)
+  
+  # get the output of `rejectMCCI`
+  # each column contains reject (TRUE) do not reject (FALSE) decisions for each repetition of the simulation for each model parameter
+  testMCCI <- do.call(rbind, getExtraOutput(sim1))
+  
+  # average each column to get the average estimated power to reject H_0 for that model parameter
+  # we'll select our sample size based on the estimated power for the indirect effect under both conditions of the moderator (i.e., > ,8)
+  testMCCIMeans <- colMeans(testMCCI) # empirical estimate of power for Monte Carlo CIs
+  
+  # add this row to our effectsByN data frame
+  effectSizes <- data.frame(N_total, testMCCIMeans["ind.w0"], testMCCIMeans["ind.w1"], testMCCIMeans["ind.diff"])
+  names(effectSizes) <- c("N", "Ind. W0", "Ind. W1", "Ind. Diff.")
+  effectsByN <- rbind(effectsByN, effectSizes)
+  print(N_total) # just for internal purposes so that I know where we are!
+}
+```
+
+And that's it!
+
+```{r simulation.table.main.results}
+effectsByN
+```
+
+Looking at our simulation results summary table, it looks like $Power >= .80$ is achieved for an $N_{min} = 234$.
+
+# Simulation 4
+
+Let's run a final `simulation 4` to examine the model parameters when under a sample size of $N = 234$.
+
+```{r simulation4, message=FALSE, warning=FALSE, include=FALSE, results=FALSE}
+# balanced group sample sizes; i.e., group N = N_total / 2
+N_total <- 234
+set.seed(12345)
+
+# instantiate an exoData data frame for exogenous variables; start W as an index vector
+exoData <- expand.grid(W = 1:(N_total))
+# the moderator W will be a binary 0/1, for dichotomized high/low SR
+exoData$W <- exoData$W %% 2
+# draw X from a standard normal distribution; my model will also be using a standardized X
+exoData$X <- rnorm(N_total, 0, 1)
+exoData$XW <- exoData$X * exoData$W # interaction term
+  
+# effect of X on M when moderator (W) == 0 (want to be able to detect a small/medium effect size of X -> M when W is *low*; X and M will with good effect size for theoretical reasons)
+a.w0 = .6
+# how much "a" path is moderated by W (i.e., interaction); i.e., the change when under moderation (want to be able to detect a small effect size *decrease* on the X -> M path [i.e., such that X -> M will *become* small] when W is *high*)
+a.mod = -.3
+# effect of M on Y when moderator (W) == 0 (small/medium effect size of X -> Y)
+b.w0 = .35
+# no moderating effect on "b" path (not looking at W as a moderator of path b)
+b.mod = 0
+# effect of X on Y when moderator (W) == 0 (small/medium effect size of X -> Y)
+c.w0 = .35
+# no moderating effect on "c" path (not looking at W as a moderator of path c)
+c.mod = 0
+# constraints on the associative effects of W with M, Y; not required
+w.M <- .1 # simple effect of moderator (W) on M when X == 0
+w.Y <- -.1 # simple effect of moderator (W) on Y when X == 0
+  
+# design our exogenous model paths for free parameters and population-estimate params
+kappa.free <- kappa.pop <- matrix(NA,  # estimate all effects
+                                  nrow = 2, # 2 outcomes (M and Y)
+                                  ncol = 3, # dummy coded X, W, XW
+                                  dimnames = list(c("M","Y"),  names(exoData)))
+kappa.free["M","X"] <- "a.w0" # label free parameters
+kappa.free["M","W"] <- "w.M" # (to define indirect effects)
+kappa.free["M","XW"] <- "a.mod"
+kappa.free["Y","X"] <- "c.w0"
+kappa.free["Y","W"] <- "w.Y"
+# fixed to 0 because we do not want the moderator to have an effect on outcome; can label like the others if we want to free
+kappa.free["Y","XW"] <- 0
+kappa.pop["M","X"] <- a.w0 # set population parameters
+kappa.pop["M","W"] <- w.M  # (defined above)
+kappa.pop["M","XW"] <- a.mod
+kappa.pop["Y","X"] <- c.w0
+kappa.pop["Y","W"] <- w.Y
+kappa.pop["Y","XW"] <- c.mod
+exoPaths <- bind(free = kappa.free, popParam = kappa.pop)
+  
+# design our endogenous model paths for free parameters and population-estimate params
+beta.free <- beta.pop <- matrix(0,
+                                nrow = 2,
+                                ncol = 2,
+                                dimnames = list(c("M","Y"), c("M","Y")))
+beta.free["Y", "M"] <- "b"
+beta.pop["Y", "M"] <- b.w0
+endoPaths <- bind(free = beta.free, popParam = beta.pop)
+  
+residCor <- binds(free = diag(as.numeric(NA), 2), popParam = diag(2))
+  
+# lavaan syntax to specify our model parameters
+userParams <- ' ## conditional indirect effects
+    ind.w0 := a.w0 * b
+    ind.w1 := (a.w0 + a.mod) * b
+  ## Test H0: equivalent indirect effects across W
+    ind.diff := a.mod * b
+  ## or equivalently:
+  # ind.diff := ind.w1 – ind.w0 '
+  
+# specify our moderated mediation model
+modMed1 <- model.path(BE = endoPaths, # the "Beta matrix"; i.e., our endogenous paths
+                      RPS = residCor, # residual correlations matrix
+                      KA = exoPaths, # the "Kappa matrix"; i.e., our exogenous paths
+                      con = userParams, # our model parameters to estimate
+                      indLab = rownames(kappa.free), # endogenous variable labels
+                      covLab = colnames(kappa.free)) # exogenous variable labels
+  
+# Uses the semTools package to determine the Monte Carlo estimates of Confidence Intervals (MCCIs) for this simulation. An MCCI through zero, of course, represents no effect with 95% confidence
+rejectMCCI <- function(object) {
+  CIs <- semTools::monteCarloCI(object)
+  # for each row:
+  #   return TRUE if the MCCI overlaps 0 (i.e., we reject H_0)
+  #   return FALSE if the MCCI does not overal 0 (i.e., we fail to reject H_0)
+  apply(CIs, 1, function(CI) 0 < CI["ci.lower"] | 0 > CI["ci.upper"])
+}
+  
+# see: https://cran.r-project.org/web/packages/simsem/simsem.pdf
+# simulate `model nRep times, using our `exoData` dataset of length `nrow(exoData)`as input
+# with random seed `seed`.
+# Additionally, the rejectMCCI function uses the semTools package to determine the Monte Carlo estimates of Confidence Intervals (MCCIs) for this simulation. An MCCI through zero, of course, represents no effect with 95% confidence, and will pass our simulated output through this function for ease of interpretation
+sim1 <- sim(nRep = 5000, model = modMed1, covData = exoData,
+            n = nrow(exoData), seed = 12345, outfun = rejectMCCI,
+            meanstructure = FALSE)
+```
+
+```{r simulation4.output}
+# describes power for each parameter
+# column 'estimate average' is the average value for this model parameter across all simulations
+# column 'power (Not equal 0)' is the estimated power to reject H_0 for this model parameter across all simulations
+# column 'average bias' is the difference between 'estimate average' and the specified population parameter for this model parameter across all simulations; abs(average bias) should be < 0.10 to be acceptable
+# column 'coverage' is the % of 95% CIs in which the 'estimate average' falls; i.e., 95% would be the expected value; large divergence from 95% coverage suggests misspecification of the parameter
+summaryParam(sim1, matchParam = TRUE, digits = 3)
+  
+# get the output of `rejectMCCI`
+# each column contains reject (TRUE) do not reject (FALSE) decisions for each repetition of the simulation for each model parameter
+testMCCI <- do.call(rbind, getExtraOutput(sim1))
+```
+
+**Therefore, my power analysis using Monte Carlo simulation in R indicates that a sample of $N_{min} = 234$ parents must be recruited to observe a medium ($Cohen's d = .6$; Cohen, 1988) indirect effect when the moderator $W = 0$, a small-medium ($d = .3$) indirect effect when the moderator $W = 1$, and small-medium ($d = -.3$) moderation effect sizes with 80% power.**
